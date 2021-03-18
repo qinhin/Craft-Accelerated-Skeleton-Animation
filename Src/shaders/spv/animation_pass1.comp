@@ -1,0 +1,294 @@
+#version 450
+struct ModelInfo
+{
+	int nodeOffset;
+	int nodeCount;
+	int childrenOffset;
+	int childrenCount;
+	int boneOffset;
+	int boneCount;
+	int animationOffset;
+	int animationCount;
+	int channelOffset;
+	int channelCount;
+	int posKeyOffset;
+	int posKeyCount;
+	int rotKeyOffset;
+	int rotKeyCount;
+	int scaKeyOffset;
+	int scaKeyCount;
+};
+layout (binding = 0) readonly buffer ModelInfoBlock{
+	ModelInfo bufModelInfos[];
+};
+
+struct NodeInfo
+{
+	mat4 transform;
+	ivec4 data0;
+	//int childrenOffset;
+	//int childrenCount;
+	//int boneIndex;
+};
+layout (binding = 1) readonly buffer NodeInfoBlock{
+	NodeInfo bufNodeInfos[];
+};
+
+
+
+layout (binding = 2) readonly buffer ChildrenInfoBlock{
+	int bufChildrenInfos[];
+};
+
+
+struct BoneInfo
+{
+	mat4 offsetMatrix;
+	ivec4 data0;
+	//int nodeIndex;
+};
+layout (binding = 3) readonly buffer BoneInfoBlock{
+	BoneInfo bufBoneInfos[];
+};
+
+struct AnimationInfo
+{
+	int channelOffset;
+	int channelCount;
+	float duration;
+	float ticksPerSecond;
+};
+layout (binding = 4) readonly buffer AnimationInfoBlock{
+	AnimationInfo bufAnimationInfos[];
+};
+
+struct ChannelInfo
+{
+	int nodeIndex;
+	int boneIndex;
+	int posKeyOffset;
+	int posKeyCount;
+	int rotKeyOffset;
+	int rotKeyCount;
+	int scaKeyOffset;
+	int scaKeyCount;
+};
+layout (binding = 5) readonly buffer ChannelInfoBlock{
+	ChannelInfo bufChannelInfos[];
+};
+
+
+layout (binding = 6) readonly buffer PosKeyBlock{
+	vec4 bufPosKeys[];
+};
+struct RotKey
+{
+	vec4 rotation;
+	vec4 data0;
+	//float time;
+};
+layout (binding = 7) readonly buffer RotKeyBlock{
+	RotKey bufRotKeys[];
+};
+layout (binding = 8) readonly buffer ScaKeyBlock{
+	vec4 bufScaKeys[];
+};
+
+
+struct InstanceInfo
+{
+	int localTransformOffset;
+	int localTransformCount;
+	int globalTransformOffset;
+	int globalTransformCount;
+	int modelID;
+	int animationID;
+	float animationTime;
+	int unused;
+};
+layout (binding = 9) readonly buffer InstanceInfoBlock{
+	InstanceInfo bufInstanceInfos[];
+};
+
+#define LOCAL_SIZE_X 64
+
+layout (local_size_x = LOCAL_SIZE_X) in;
+
+layout (binding = 10) buffer LocalTransformBlock{
+	mat4 bufLocalTransforms[];
+};
+layout (binding = 11) buffer GlobalTransformBlock{
+	mat4 bufGlobalTransforms[];
+};
+
+layout (binding = 12) uniform InstanceSizeBlock{
+	int unifInstanceSize;
+};
+
+vec4 mixQuaternion(vec4 from, vec4 to, float t)
+{
+	vec4 z = to;
+	float cosTheta = dot(from, to);
+	if (cosTheta < 0)
+	{
+		z = -to;
+		cosTheta = -cosTheta;
+	}
+	if (cosTheta > 1 - 1.192092896e-07F)
+	{
+		return vec4(
+			mix(from.x, z.x, t),
+			mix(from.y, z.y, t),
+			mix(from.z, z.z, t),
+			mix(from.w, z.w, t));
+	}
+	else
+	{
+		float angle = acos(cosTheta);
+		return (
+			sin((1 - t) * angle) * from 
+			+ sin(t * angle) * z)
+			/ sin(angle);
+	}
+}
+
+mat4 builtPositionTransform(vec3 pos)
+{
+	mat4 m = mat4(1.0);
+	m[3].xyz = pos;
+	return m;
+}
+mat4 builtRotationTransform(vec4 quat)
+{
+	mat4 Rotate = mat4(1);
+	float qxx=(quat.x * quat.x);
+	float qyy=(quat.y * quat.y);
+	float qzz=(quat.z * quat.z);
+	float qxz=(quat.x * quat.z);
+	float qxy=(quat.x * quat.y);
+	float qyz=(quat.y * quat.z);
+	float qwx=(quat.w * quat.x);
+	float qwy=(quat.w * quat.y);
+	float qwz=(quat.w * quat.z);
+	Rotate[0][0] = 1 - 2 * (qyy + qzz);
+	Rotate[0][1] = 2 * (qxy + qwz);
+	Rotate[0][2] = 2 * (qxz - qwy);
+	Rotate[1][0] = 2 * (qxy - qwz);
+	Rotate[1][1] = 1 - 2 * (qxx + qzz);
+	Rotate[1][2] = 2 * (qyz + qwx);
+	Rotate[2][0] = 2 * (qxz + qwy);
+	Rotate[2][1] = 2 * (qyz - qwx);
+	Rotate[2][2] = 1 - 2 * (qxx + qyy);
+	return Rotate;
+}
+mat4 builtScalingTransform(vec3 sca)
+{
+	mat4 m = mat4(1.0);
+	m[0][0] = sca[0];
+	m[1][1] = sca[1];
+	m[2][2] = sca[2];
+	return m;
+}
+
+void main()
+{
+	uint instanceID = gl_WorkGroupID.x;
+	uint localID = gl_LocalInvocationID.x;
+
+	InstanceInfo instanceInfo = bufInstanceInfos[instanceID];
+	ModelInfo modelInfo = bufModelInfos[instanceInfo.modelID];
+	
+	
+	AnimationInfo animationInfo = bufAnimationInfos[modelInfo.animationOffset + instanceInfo.animationID];
+	float ticksPerSecond = animationInfo.ticksPerSecond > 16.7 ? animationInfo.ticksPerSecond : 25.0;
+	float timeInTicks = instanceInfo.animationTime * ticksPerSecond;
+	float animationTime = mod(timeInTicks, animationInfo.duration);
+
+	vec3 position, scaling;
+	vec4 rotation;
+	int t, left, right, frame, nextFrame;
+	float diffTime;
+	ChannelInfo channelInfo;
+	for(int c = int(localID); c < animationInfo.channelCount; c += LOCAL_SIZE_X)
+	{
+ 
+		channelInfo = bufChannelInfos[modelInfo.channelOffset + animationInfo.channelOffset + c];
+		int posKeyOffset = modelInfo.posKeyOffset + channelInfo.posKeyOffset;
+		int rotKeyOffset = modelInfo.rotKeyOffset + channelInfo.rotKeyOffset;
+		int scaKeyOffset = modelInfo.scaKeyOffset + channelInfo.scaKeyOffset;
+
+		// position
+		left = 0;
+		right = channelInfo.posKeyCount - 1;
+		for(int i = 0; i < 64; i++)
+		{
+			if(left >= right) break;
+			t = (left + right) / 2;
+			if(bufPosKeys[posKeyOffset + t].w > animationTime) right = t - 1;
+			else left = t;
+		}	
+		frame = right < 0 ? 0 : right;
+		nextFrame = (frame + 1) % channelInfo.posKeyCount;
+		diffTime = bufPosKeys[posKeyOffset + nextFrame].w - bufPosKeys[posKeyOffset + frame].w;
+		if (diffTime < 0.0) diffTime += animationInfo.duration;
+		if (diffTime > 0){
+			float factor = (animationTime - bufPosKeys[posKeyOffset + frame].w) / diffTime;
+			position = mix(bufPosKeys[posKeyOffset + frame].xyz, bufPosKeys[posKeyOffset + nextFrame].xyz, factor);
+		}else position = bufPosKeys[posKeyOffset + nextFrame].xyz;
+
+
+		// rotation
+		left = 0;
+		right = channelInfo.rotKeyCount - 1;
+		for(int i = 0; i < 64; i++)
+		{
+			if(left >= right) break;
+			t = (left + right) / 2;
+			if(bufRotKeys[rotKeyOffset + t].data0.x > animationTime) right = t - 1;
+			else left = t;
+		}	
+		frame = right < 0 ? 0 : right;
+		nextFrame = (frame + 1) % channelInfo.rotKeyCount;
+		diffTime = bufRotKeys[rotKeyOffset + nextFrame].data0.x - bufRotKeys[rotKeyOffset + frame].data0.x;
+		if (diffTime < 0.0) diffTime += animationInfo.duration;
+		if (diffTime > 0){
+			float factor = (animationTime - bufRotKeys[rotKeyOffset + frame].data0.x) / diffTime;
+			rotation = mixQuaternion(bufRotKeys[rotKeyOffset + frame].rotation, bufRotKeys[rotKeyOffset + nextFrame].rotation, factor);
+		}else rotation = bufRotKeys[rotKeyOffset + nextFrame].rotation;	
+
+
+		// scaling
+		left = 0;
+		right = channelInfo.scaKeyCount - 1;
+		for(int i = 0; i < 64; i++)
+		{
+			if(left >= right) break;
+			t = (left + right) / 2;
+			if(bufScaKeys[scaKeyOffset + t].w > animationTime) right = t - 1;
+			else left = t;
+		}	
+		frame = right < 0 ? 0 : right;
+		nextFrame = (frame + 1) % channelInfo.scaKeyCount;
+		diffTime = bufScaKeys[scaKeyOffset + nextFrame].w - bufScaKeys[scaKeyOffset + frame].w;
+		if (diffTime < 0.0) diffTime += animationInfo.duration;
+		if (diffTime > 0){
+			float factor = (animationTime - bufScaKeys[scaKeyOffset + frame].w) / diffTime;
+			scaling = mix(bufScaKeys[scaKeyOffset + frame].xyz, bufScaKeys[scaKeyOffset + nextFrame].xyz, factor);
+		}else scaling = bufScaKeys[scaKeyOffset + nextFrame].xyz;
+
+		mat4 transformMatrix = builtPositionTransform(position) * builtRotationTransform(rotation) * builtScalingTransform(scaling);
+		
+		bufLocalTransforms[instanceInfo.localTransformOffset + c] = transformMatrix;
+	}
+
+	//for(int c = int(localID); c < instanceInfo.globalTransformCount; c += LOCAL_SIZE_X)
+	//{
+	//	bufGlobalTransforms[instanceInfo.globalTransformOffset + c] = mat4(2.0);	
+	//}
+
+}
+
+
+
+
+

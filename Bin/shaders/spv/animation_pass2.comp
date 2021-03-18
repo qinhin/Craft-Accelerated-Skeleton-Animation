@@ -1,0 +1,216 @@
+#version 450
+
+struct ModelInfo
+{
+	int nodeOffset;
+	int nodeCount;
+	int childrenOffset;
+	int childrenCount;
+	int boneOffset;
+	int boneCount;
+	int animationOffset;
+	int animationCount;
+	int channelOffset;
+	int channelCount;
+	int posKeyOffset;
+	int posKeyCount;
+	int rotKeyOffset;
+	int rotKeyCount;
+	int scaKeyOffset;
+	int scaKeyCount;
+};
+layout (binding = 0) readonly buffer ModelInfoBlock{
+	ModelInfo bufModelInfos[];
+};
+
+struct NodeInfo
+{
+	mat4 transform;
+	ivec4 data0;
+	//int childrenOffset;
+	//int childrenCount;
+	//int boneIndex;
+};
+layout (binding = 1) readonly buffer NodeInfoBlock{
+	NodeInfo bufNodeInfos[];
+};
+
+
+
+layout (binding = 2) readonly buffer ChildrenInfoBlock{
+	int bufChildrenInfos[];
+};
+
+
+struct BoneInfo
+{
+	mat4 offsetMatrix;
+	ivec4 data0;
+	//int nodeIndex;
+};
+layout (binding = 3) readonly buffer BoneInfoBlock{
+	BoneInfo bufBoneInfos[];
+};
+
+struct AnimationInfo
+{
+	int channelOffset;
+	int channelCount;
+	float duration;
+	float ticksPerSecond;
+};
+layout (binding = 4) readonly buffer AnimationInfoBlock{
+	AnimationInfo bufAnimationInfos[];
+};
+
+struct ChannelInfo
+{
+	int nodeIndex;
+	int boneIndex;
+	int posKeyOffset;
+	int posKeyCount;
+	int rotKeyOffset;
+	int rotKeyCount;
+	int scaKeyOffset;
+	int scaKeyCount;
+};
+layout (binding = 5) readonly buffer ChannelInfoBlock{
+	ChannelInfo bufChannelInfos[];
+};
+
+
+layout (binding = 6) readonly buffer PosKeyBlock{
+	vec4 bufPosKeys[];
+};
+struct RotKey
+{
+	vec4 rotation;
+	vec4 data0;
+	//float time;
+};
+layout (binding = 7) readonly buffer RotKeyBlock{
+	RotKey bufRotKeys[];
+};
+layout (binding = 8) readonly buffer ScaKeyBlock{
+	vec4 bufScaKeys[];
+};
+
+
+struct InstanceInfo
+{
+	int localTransformOffset;
+	int localTransformCount;
+	int globalTransformOffset;
+	int globalTransformCount;
+	int modelID;
+	int animationID;
+	float animationTime;
+	int unused;
+};
+layout (binding = 9) readonly buffer InstanceInfoBlock{
+	InstanceInfo bufInstanceInfos[];
+};
+
+#define LOCAL_SIZE_X 256
+#define MAX_NODE 256
+#define MAX_DEPTH 64
+#define MAX_LOOP 512
+
+layout (local_size_x = LOCAL_SIZE_X) in;
+
+layout (binding = 10) buffer LocalTransformBlock{
+	mat4 bufLocalTransforms[];
+};
+layout (binding = 11) buffer GlobalTransformBlock{
+	mat4 bufGlobalTransforms[];
+};
+
+layout (binding = 12) uniform InstanceSizeBlock{
+	int unifInstanceSize;
+};
+
+
+
+void main()
+{
+	uint localID = gl_LocalInvocationID.x;
+	uint instanceID = gl_WorkGroupID.x * LOCAL_SIZE_X + localID;
+	if (instanceID >= unifInstanceSize) return;
+
+	InstanceInfo instanceInfo = bufInstanceInfos[instanceID];
+	ModelInfo modelInfo = bufModelInfos[instanceInfo.modelID];
+				
+	AnimationInfo animationInfo = bufAnimationInfos[modelInfo.animationOffset + instanceInfo.animationID];
+	int nodeOffset = modelInfo.nodeOffset;
+
+
+	mat4 parentTransformStack[MAX_DEPTH];
+	ivec4 childrenStack[MAX_DEPTH];
+	int depth = 0;	
+	mat4 globalTransform;
+
+	parentTransformStack[depth] = mat4(1.0);
+	childrenStack[depth].x = 0;
+	childrenStack[depth].y = 0;
+	childrenStack[depth].z = bufNodeInfos[nodeOffset].data0[1]; //childrenCount;
+	childrenStack[depth].w = 1;
+
+	mat4 inv_root_transform = inverse(bufNodeInfos[nodeOffset].transform);
+	int nodeMappingChannel[MAX_NODE];
+	int channelOffset = instanceInfo.localTransformOffset;
+	int channelOffset2 = modelInfo.channelOffset;
+	int boneOffset = instanceInfo.globalTransformOffset;
+	int boneOffset2 = modelInfo.boneOffset;
+	for(int i = 0; i < modelInfo.nodeCount && i < MAX_NODE; i++) nodeMappingChannel[i] = -1;
+	for(int i = 0; i < animationInfo.channelCount && i < MAX_NODE; i++) nodeMappingChannel[bufChannelInfos[channelOffset2 + i].nodeIndex] = i;
+	for(int i = 0; i < MAX_LOOP; i++)
+	{
+		mat4 parentTransform = parentTransformStack[depth];
+		NodeInfo nodeInfo = bufNodeInfos[nodeOffset + childrenStack[depth].x];
+		if(childrenStack[depth].w > 0)
+		{
+			childrenStack[depth].w = -1;
+
+			globalTransform = nodeInfo.transform;
+			int bone_idx = nodeInfo.data0[2];
+			int channel_idx = nodeMappingChannel[childrenStack[depth].x];
+			if (channel_idx >= 0) globalTransform = bufLocalTransforms[channelOffset + channel_idx];
+			else if (bone_idx >= 0) globalTransform = mat4(1.0);
+
+			globalTransform = parentTransform * globalTransform;
+			if (bone_idx >= 0)
+			{
+				bufGlobalTransforms[boneOffset + bone_idx] = inv_root_transform *
+				globalTransform * bufBoneInfos[boneOffset2 + bone_idx].offsetMatrix;
+			}
+			parentTransformStack[depth] = globalTransform;
+			parentTransform = globalTransform;
+		}
+		if(childrenStack[depth].y < childrenStack[depth].z)
+		{
+			int childrenOffset = modelInfo.childrenOffset + nodeInfo.data0[0];
+			int childrenIndex = childrenOffset + childrenStack[depth].y;
+			childrenStack[depth].y++;
+
+			int childrenInfoIndex = bufChildrenInfos[childrenIndex];
+			depth++;
+			parentTransformStack[depth] = parentTransform;
+			childrenStack[depth].x = childrenInfoIndex;
+			childrenStack[depth].y = 0;
+			childrenStack[depth].z = bufNodeInfos[nodeOffset + childrenInfoIndex].data0[1];
+			childrenStack[depth].w = 1;
+		}
+		else depth--;
+		if(depth < 0) break;
+	}
+
+	//for(int c = 0; c < instanceInfo.globalTransformCount; c++)
+	//{
+	//	bufGlobalTransforms[instanceInfo.globalTransformOffset + c] = mat4(1.0);	
+	//}
+}
+
+
+
+
+
